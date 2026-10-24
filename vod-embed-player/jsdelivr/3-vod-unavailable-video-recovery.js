@@ -1,0 +1,534 @@
+/* Generated from 3-vod-unavailable-video-recovery.html - edit the .html, then regenerate. */
+(function () {
+  "use strict";
+
+  /* ==========================================
+     CONFIG
+  ========================================== */
+
+  const CHECK_INTERVAL = 1000;
+
+  // Give YouTube time to initialize the video.
+  const UNAVAILABLE_TIMEOUT = 25000;
+
+  // Require repeated stalled checks before skipping.
+  const REQUIRED_STUCK_CHECKS = 8;
+
+  // Wait briefly before changing playlist items.
+  const SKIP_DELAY = 1500;
+
+  // Only attempt recovery once per video ID.
+  const MAX_SKIP_ATTEMPTS_PER_VIDEO = 1;
+
+  // Playback must advance by this much to count
+  // as actual progress.
+  const PROGRESS_THRESHOLD = 0.5;
+
+  let debugEnabled = false;
+  let started = false;
+  let monitorInterval = null;
+  let skipTimeout = null;
+  let unlockTimeout = null;
+
+  let currentVideoId = null;
+  let currentIndex = null;
+
+  let videoObservedAt = 0;
+  let lastProgressAt = 0;
+  let lastPlaybackTime = null;
+  let stuckChecks = 0;
+  let skipInProgress = false;
+
+  const skipAttempts = new Map();
+
+  /* ==========================================
+     LOGGING
+  ========================================== */
+
+  function log(...args) {
+    if (debugEnabled) {
+      console.log("[VODRecovery]", ...args);
+    }
+  }
+
+  function warn(...args) {
+    console.warn("[VODRecovery]", ...args);
+  }
+
+  function error(...args) {
+    console.error("[VODRecovery]", ...args);
+  }
+
+  /* ==========================================
+     PUBLIC CONTROLS
+  ========================================== */
+
+  window.VODRecovery = {
+    ready: false,
+
+    debug(value) {
+      if (typeof value === "boolean") {
+        debugEnabled = value;
+      }
+
+      console.log(
+        "[VODRecovery] Debug:",
+        debugEnabled ? "ON" : "OFF"
+      );
+
+      return debugEnabled;
+    },
+
+    status() {
+      const result = {
+        ready: this.ready,
+        debug: debugEnabled,
+        videoId: currentVideoId,
+        playlistIndex: currentIndex,
+        videoObservedAt,
+        lastProgressAt,
+        lastPlaybackTime,
+        stuckChecks,
+        skipInProgress,
+        skipAttempts: Object.fromEntries(skipAttempts)
+      };
+
+      console.log("[VODRecovery] Status:", result);
+      return result;
+    },
+
+    check() {
+      monitor();
+      return this.status();
+    }
+  };
+
+  /* ==========================================
+     GET PLAYER
+  ========================================== */
+
+  function getPlayer() {
+    const player = window.player;
+
+    if (
+      !player ||
+      typeof player.getPlayerState !== "function" ||
+      typeof player.getVideoData !== "function" ||
+      typeof player.getCurrentTime !== "function"
+    ) {
+      return null;
+    }
+
+    return player;
+  }
+
+  /* ==========================================
+     RESET VIDEO TRACKING
+  ========================================== */
+
+  function resetVideoTracking() {
+    currentVideoId = null;
+    currentIndex = null;
+
+    videoObservedAt = Date.now();
+    lastProgressAt = Date.now();
+
+    lastPlaybackTime = null;
+    stuckChecks = 0;
+  }
+
+  /* ==========================================
+     MOVE TO NEXT VIDEO
+  ========================================== */
+
+  function skipCurrentVideo(reason) {
+    const player = getPlayer();
+
+    if (!player || skipInProgress) {
+      return;
+    }
+
+    let playlist;
+    let index;
+    let data;
+
+    try {
+      playlist = player.getPlaylist();
+      index = player.getPlaylistIndex();
+      data = player.getVideoData();
+    } catch (err) {
+      error("Could not inspect player before skipping:", err);
+      return;
+    }
+
+    if (
+      !playlist ||
+      !playlist.length ||
+      !Number.isInteger(index) ||
+      index < 0 ||
+      index >= playlist.length
+    ) {
+      warn("Cannot safely skip: playlist/index unavailable.");
+      return;
+    }
+
+    const videoId =
+      data && data.video_id
+        ? data.video_id
+        : playlist[index];
+
+    if (!videoId) {
+      warn("Cannot safely skip: current video ID unavailable.");
+      return;
+    }
+
+    const attempts =
+      skipAttempts.get(videoId) || 0;
+
+    if (attempts >= MAX_SKIP_ATTEMPTS_PER_VIDEO) {
+      warn("Skip limit reached for video:", videoId);
+      return;
+    }
+
+    skipAttempts.set(videoId, attempts + 1);
+    skipInProgress = true;
+
+    warn("Skipping unavailable or stalled video:", {
+      videoId,
+      index,
+      reason
+    });
+
+    clearTimeout(skipTimeout);
+    clearTimeout(unlockTimeout);
+
+    skipTimeout = setTimeout(function () {
+      try {
+        const latestPlayer = getPlayer();
+
+        if (!latestPlayer) {
+          skipInProgress = false;
+          return;
+        }
+
+        const latestPlaylist =
+          latestPlayer.getPlaylist();
+
+        const latestIndex =
+          latestPlayer.getPlaylistIndex();
+
+        const latestData =
+          latestPlayer.getVideoData();
+
+        const latestVideoId =
+          latestData && latestData.video_id
+            ? latestData.video_id
+            : latestPlaylist?.[latestIndex];
+
+        // Don't skip a different video if YouTube
+        // advanced naturally during the delay.
+        if (
+          !latestPlaylist ||
+          latestIndex !== index ||
+          latestVideoId !== videoId
+        ) {
+          log("Skip cancelled because the current video changed.");
+          skipInProgress = false;
+          return;
+        }
+
+        // Advance to the next item, wrapping at the end.
+        const nextIndex =
+          index + 1 < latestPlaylist.length
+            ? index + 1
+            : 0;
+
+        if (nextIndex === index) {
+          warn("No alternative playlist item is available.");
+          skipInProgress = false;
+          return;
+        }
+
+        resetVideoTracking();
+
+        latestPlayer.playVideoAt(nextIndex);
+
+        log("Requested next playlist item:", nextIndex + 1);
+
+        // Prevent immediate duplicate recovery attempts
+        // while YouTube changes to the next video.
+        unlockTimeout = setTimeout(function () {
+          skipInProgress = false;
+        }, 7000);
+
+      } catch (err) {
+        skipInProgress = false;
+        error("Failed to skip video:", err);
+      }
+    }, SKIP_DELAY);
+  }
+
+  /* ==========================================
+     YOUTUBE API ERROR HANDLER
+  ========================================== */
+
+  window.__joqnixVODRecoveryOnError = function (event) {
+    if (!event || typeof event.data !== "number") {
+      return;
+    }
+
+    const code = event.data;
+
+    log("YouTube player error:", code);
+
+    // 100: video not found or private
+    // 101/150: embedding prohibited
+    if ([100, 101, 150].includes(code)) {
+      skipCurrentVideo("YouTube player error " + code);
+      return;
+    }
+
+    // Code 5 is ambiguous. Let the monitor determine
+    // whether playback can recover.
+    if (code === 5) {
+      log("HTML5 player error; monitoring playback progress.");
+    }
+
+    // Code 153 can indicate missing client identification
+    // or Referer information. Avoid skipping every VOD
+    // automatically for a potentially global player issue.
+    if (code === 153) {
+      warn(
+        "YouTube error 153 detected. This may be a player configuration issue."
+      );
+    }
+  };
+
+  /* ==========================================
+     ATTACH ERROR HANDLER
+  ========================================== */
+
+  function attachErrorHandler(player) {
+    if (player.__joqnixRecoveryAttached) {
+      return;
+    }
+
+    try {
+      if (typeof player.addEventListener !== "function") {
+        warn("Player does not expose addEventListener.");
+        return;
+      }
+
+      player.addEventListener(
+        "onError",
+        "__joqnixVODRecoveryOnError"
+      );
+
+      player.__joqnixRecoveryAttached = true;
+
+      log("YouTube error handler attached.");
+    } catch (err) {
+      error("Could not attach YouTube error handler:", err);
+    }
+  }
+
+  /* ==========================================
+     FALLBACK MONITOR
+  ========================================== */
+
+  function monitor() {
+    const player = getPlayer();
+
+    if (!player) {
+      return;
+    }
+
+    attachErrorHandler(player);
+
+    let data;
+    let index;
+    let state;
+    let duration;
+    let currentTime;
+    let playlist;
+
+    try {
+      data = player.getVideoData();
+      index = player.getPlaylistIndex();
+      state = player.getPlayerState();
+      duration = player.getDuration();
+      currentTime = player.getCurrentTime();
+      playlist = player.getPlaylist();
+    } catch (err) {
+      log("Player is not ready for monitoring.");
+      return;
+    }
+
+    if (
+      !data ||
+      !data.video_id ||
+      !Number.isInteger(index) ||
+      index < 0
+    ) {
+      return;
+    }
+
+    const videoId = data.video_id;
+
+    // Track when the current video changes.
+    if (
+      videoId !== currentVideoId ||
+      index !== currentIndex
+    ) {
+      currentVideoId = videoId;
+      currentIndex = index;
+
+      videoObservedAt = Date.now();
+      lastProgressAt = Date.now();
+
+      lastPlaybackTime =
+        Number.isFinite(currentTime)
+          ? currentTime
+          : null;
+
+      stuckChecks = 0;
+
+      log("Monitoring video:", {
+        videoId,
+        index,
+        title: data.title,
+        state,
+        currentTime,
+        duration
+      });
+    }
+
+    if (skipInProgress) {
+      return;
+    }
+
+    const now = Date.now();
+
+    // A video counts as progressing only when its
+    // playback timestamp actually advances.
+    if (
+      Number.isFinite(currentTime) &&
+      lastPlaybackTime !== null &&
+      currentTime > lastPlaybackTime + PROGRESS_THRESHOLD
+    ) {
+      lastPlaybackTime = currentTime;
+      lastProgressAt = now;
+      stuckChecks = 0;
+
+      log("Playback progress detected:", {
+        videoId,
+        currentTime
+      });
+
+      return;
+    }
+
+    // Initialize the timestamp baseline.
+    if (
+      Number.isFinite(currentTime) &&
+      lastPlaybackTime === null
+    ) {
+      lastPlaybackTime = currentTime;
+    }
+
+    // Don't classify a normal paused video as unavailable.
+    // BUFFERING is monitored because it can also be the
+    // state reported by a blocked or stalled video.
+    if (state === YT.PlayerState.PAUSED) {
+      lastProgressAt = now;
+      stuckChecks = 0;
+      return;
+    }
+
+    const elapsedSinceStart =
+      now - videoObservedAt;
+
+    const elapsedSinceProgress =
+      now - lastProgressAt;
+
+    // The player can report a duration for an unavailable
+    // video. Duration alone is deliberately not considered
+    // evidence that playback has started.
+    const potentiallyStuck =
+      state === YT.PlayerState.UNSTARTED ||
+      state === YT.PlayerState.BUFFERING ||
+      state === YT.PlayerState.PLAYING ||
+      state === YT.PlayerState.CUED;
+
+    if (!potentiallyStuck) {
+      stuckChecks = 0;
+      return;
+    }
+
+    if (
+      elapsedSinceStart < UNAVAILABLE_TIMEOUT ||
+      elapsedSinceProgress < UNAVAILABLE_TIMEOUT
+    ) {
+      return;
+    }
+
+    stuckChecks++;
+
+    log("Possible unavailable/stalled video:", {
+      videoId,
+      state,
+      currentTime,
+      duration,
+      elapsedSinceStart,
+      elapsedSinceProgress,
+      stuckChecks,
+      playlistLength: playlist?.length
+    });
+
+    if (stuckChecks >= REQUIRED_STUCK_CHECKS) {
+      skipCurrentVideo(
+        "No playback-time progress for " +
+        Math.round(elapsedSinceProgress / 1000) +
+        " seconds"
+      );
+    }
+  }
+
+  /* ==========================================
+     STARTUP
+  ========================================== */
+
+  function start() {
+    if (started) {
+      return;
+    }
+
+    started = true;
+
+    log("Recovery system started.");
+
+    monitorInterval = setInterval(
+      monitor,
+      CHECK_INTERVAL
+    );
+
+    window.VODRecovery.ready = true;
+  }
+
+  // Wait for Code 1 to initialize the existing player.
+  const startupInterval = setInterval(function () {
+    if (getPlayer()) {
+      clearInterval(startupInterval);
+      start();
+    }
+  }, 500);
+
+  // Stop polling forever if the player never initializes.
+  setTimeout(function () {
+    if (!started) {
+      clearInterval(startupInterval);
+      warn("Player not detected. Recovery did not start.");
+    }
+  }, 120000);
+
+})();

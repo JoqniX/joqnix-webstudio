@@ -20,6 +20,11 @@
   // (covers paused, buffering, unstarted, cued and ended).
   const NOT_PLAYING_LIMIT = 10 * 60 * 1000;
 
+  // Shorter limit used until the player has PLAYED once after page
+  // load. Covers the player never being created (YouTube API did
+  // not load) or never starting playback.
+  const STARTUP_LIMIT = 45 * 1000;
+
   // Reload if this many unavailable-video errors happen
   // within ERROR_WINDOW (the playlist is likely broken
   // or the player is in a bad state).
@@ -28,7 +33,7 @@
 
   // Loop guard: never reload more than MAX_RELOADS times
   // within RELOAD_WINDOW.
-  const MAX_RELOADS = 3;
+  const MAX_RELOADS = 5;
   const RELOAD_WINDOW = 30 * 60 * 1000;
 
   const RELOAD_LOG_KEY = "joqnix_vod_watchdog_reloads";
@@ -41,7 +46,9 @@
   let started = false;
   let reloadStarted = false;
 
-  let notPlayingSince = null;
+  // Counts from page load, so "player never appeared" is timed too.
+  let notPlayingSince = Date.now();
+  let hasPlayed = false;
   let errorTimes = [];
 
   /* ==========================================
@@ -192,25 +199,32 @@
   ========================================== */
 
   function check() {
+    const now = Date.now();
+    const limit = hasPlayed ? NOT_PLAYING_LIMIT : STARTUP_LIMIT;
     const player = getPlayer();
 
-    if (!player) {
-      return;
+    let state = null;
+
+    if (player) {
+      attachErrorHandler(player);
+
+      try {
+        state = player.getPlayerState();
+      } catch (err) {
+        state = null;
+      }
     }
-
-    attachErrorHandler(player);
-
-    let state;
-
-    try {
-      state = player.getPlayerState();
-    } catch (err) {
-      return;
-    }
-
-    const now = Date.now();
 
     if (state === STATE_PLAYING) {
+      if (!hasPlayed) {
+        hasPlayed = true;
+
+        // Healthy start: give future failures a fresh reload budget.
+        writeReloadLog([]);
+
+        log("Playback confirmed.");
+      }
+
       notPlayingSince = null;
       return;
     }
@@ -223,12 +237,16 @@
 
     const elapsed = now - notPlayingSince;
 
-    log("Not playing for", Math.round(elapsed / 1000), "s, state:", state);
+    log(
+      "Not playing for", Math.round(elapsed / 1000), "s, state:",
+      state === null ? "no player" : state
+    );
 
-    if (elapsed >= NOT_PLAYING_LIMIT) {
+    if (elapsed >= limit) {
       reloadPage(
-        "Player not playing for " +
-        Math.round(elapsed / 60000) + " min (state " + state + ")"
+        (hasPlayed ? "Player stalled" : "Player never started") +
+        " for " + Math.round(elapsed / 1000) + "s (" +
+        (state === null ? "no player" : "state " + state) + ")"
       );
     }
   }
@@ -257,6 +275,7 @@
       const result = {
         ready: this.ready,
         debug: debugEnabled,
+        hasPlayed: hasPlayed,
         notPlayingForSeconds:
           notPlayingSince === null
             ? 0
@@ -287,20 +306,8 @@
     log("Watchdog started.");
   }
 
-  const startupInterval = setInterval(function () {
-    if (getPlayer()) {
-      clearInterval(startupInterval);
-      start();
-    }
-  }, 500);
-
-  // Stop polling if the player never initializes.
-  setTimeout(function () {
-    if (!started) {
-      clearInterval(startupInterval);
-      warn("Player not detected. Watchdog did not start.");
-    }
-  }, 120000);
+  // Start immediately; check() handles the player not existing yet.
+  start();
 
 })();
 </script>

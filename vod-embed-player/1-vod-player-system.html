@@ -48,7 +48,7 @@
         "YouTube iframe not found yet"
       );
 
-      return;
+      return false;
     }
 
     let src = iframe.src;
@@ -96,15 +96,31 @@
 
     }
 
+    return true;
+
   }
 
 
-  /* Wait for Webstudio iframe render */
+  /* Retry until Webstudio has rendered the iframe (up to 30s).
+     Harmless once fixed: src only changes when it differs. */
 
-  setTimeout(
-    fixYouTubeIframe,
-    1500
-  );
+  let fixAttempts = 0;
+
+  const fixInterval =
+    setInterval(
+      function () {
+
+        fixAttempts++;
+
+        fixYouTubeIframe();
+
+        if (fixAttempts >= 60) {
+          clearInterval(fixInterval);
+        }
+
+      },
+      500
+    );
 
 })();
 </script>
@@ -529,6 +545,20 @@
     }
 
 
+    /* API script must be loaded */
+
+    if (!window.YT || !window.YT.Player) {
+      return;
+    }
+
+
+    /* iframe must already have enablejsapi=1 (set by the fixer) */
+
+    if (!iframe.src.includes("enablejsapi=1")) {
+      return;
+    }
+
+
     clearInterval(
       iframeReadyInterval
     );
@@ -556,13 +586,63 @@
       );
 
 
-      iframeReadyInterval =
-        setInterval(
-          waitForIframe,
-          500
-        );
+      startIframePolling();
 
     };
+
+
+  /* Poll from page load instead of relying only on the API-ready
+     callback, which can be missed or never fire. */
+
+  function startIframePolling() {
+
+    if (iframeReadyInterval || window.player) {
+      return;
+    }
+
+    iframeReadyInterval =
+      setInterval(
+        waitForIframe,
+        500
+      );
+
+  }
+
+  startIframePolling();
+
+
+  /* Re-inject the API script if it has not loaded (every 10s, 3 tries) */
+
+  let apiRetries = 0;
+
+  const apiRetryInterval =
+    setInterval(
+      function () {
+
+        if (window.YT && window.YT.Player) {
+          clearInterval(apiRetryInterval);
+          return;
+        }
+
+        apiRetries++;
+
+        if (apiRetries > 3) {
+          clearInterval(apiRetryInterval);
+          return;
+        }
+
+        console.warn(
+          "[VODPlayer] YouTube API not loaded, retrying (" +
+          apiRetries + ")"
+        );
+
+        const s = document.createElement("script");
+        s.src = "https://www.youtube.com/iframe_api";
+        document.head.appendChild(s);
+
+      },
+      10000
+    );
 
 
   /* =========================
