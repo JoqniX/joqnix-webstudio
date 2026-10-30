@@ -1,7 +1,14 @@
 /* Generated from 1-creator-oauth-page.html - edit the .html, then regenerate. */
-document.addEventListener("DOMContentLoaded", async () => {
-  const supabase = window.supabaseClient;
-  const root = document.getElementById("creator-oauth-content");
+(function () {
+async function start() {
+  // wait (up to 10s) for the Supabase client and the page container to exist
+  let supabase, root;
+  for (let i = 0; i < 100; i++) {
+    supabase = window.supabaseClient;
+    root = document.getElementById("creator-oauth-content");
+    if (supabase && root) break;
+    await new Promise((r) => setTimeout(r, 100));
+  }
   if (!supabase || !root) return;
 
   root.innerHTML = `<div class="co-loading">Loading…</div>`;
@@ -238,4 +245,11 @@ document.addEventListener("DOMContentLoaded", async () => {
       window.location.reload();
     };
   });
-});
+}
+
+if (document.readyState === "loading") {
+  document.addEventListener("DOMContentLoaded", start);
+} else {
+  start();
+}
+})();
